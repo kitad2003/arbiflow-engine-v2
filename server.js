@@ -1,3 +1,4 @@
+﻿
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
@@ -64,10 +65,7 @@ const state = {
 };
 
 function toBaseUnits(amount, decimals) {
-  const value = Number(amount).toFixed(decimals);
-  const parts = value.split(".");
-  const whole = parts[0];
-  const fraction = parts[1] || "";
+  const [whole, fraction = ""] = Number(amount).toFixed(decimals).split(".");
   return (
     BigInt(whole) * (10n ** BigInt(decimals)) +
     BigInt(fraction.padEnd(decimals, "0"))
@@ -77,10 +75,20 @@ function toBaseUnits(amount, decimals) {
 function fromBaseUnits(value, decimals) {
   const amount = BigInt(value);
   const divisor = 10n ** BigInt(decimals);
-  return Number(amount / divisor) + Number(amount % divisor) / Number(divisor);
+
+  return (
+    Number(amount / divisor) +
+    Number(amount % divisor) / Number(divisor)
+  );
 }
 
-async function getPrice(network, sellToken, buyToken, sellAmount, attempt = 1) {
+async function getPrice(
+  network,
+  sellToken,
+  buyToken,
+  sellAmount,
+  attempt = 1
+) {
   const params = new URLSearchParams({
     chainId: String(network.chainId),
     sellToken: sellToken.address,
@@ -190,6 +198,49 @@ async function quoteRoute(network, route, tradeSize) {
   const legs = [];
 
   for (let index = 0; index < route.length - 1; index++) {
+    const fromSymbol = route[index];
+    const toSymbol = route[index + 1];
+
+    const fromToken = network.tokens[fromSymbol];
+    const toToken = network.tokens[toSymbol];
+
+    if (!fromToken || !toToken) {
+      throw new Error("Token missing from network configuration");
+    }
+
+    const amountIn = currentAmount;
+
+    const quote = await getPrice(
+      network,
+      fromToken,
+      toToken,
+      toBaseUnits(amountIn, fromToken.decimals)
+    );
+
+    const amountOut = fromBaseUnits(
+      quote.buyAmount,
+      toToken.decimals
+    );
+
+    legs.push({
+      from: fromSymbol,
+      to: toSymbol,
+      amountIn: Number(amountIn.toFixed(8)),
+      amountOut: Number(amountOut.toFixed(8)),
+      quotedAt: new Date().toISOString()
+    });
+
+    currentAmount = amountOut;
+
+    await sleep(700);
+  }
+
+  return {
+    finalAmount: currentAmount,
+    legs
+  };
+}
+
 function evaluateResult(network, route, tradeSize, routeQuote) {
   const returned = routeQuote.finalAmount;
   const grossProfit = returned - tradeSize;
@@ -201,9 +252,6 @@ function evaluateResult(network, route, tradeSize, routeQuote) {
 
   const estimatedNet =
     grossProfit - safetyReserve;
-
-  const roi =
-    (estimatedNet / tradeSize) * 100;
 
   return {
     id: [
@@ -228,7 +276,10 @@ function evaluateResult(network, route, tradeSize, routeQuote) {
     grossProfit: Number(grossProfit.toFixed(6)),
     safetyReserve: Number(safetyReserve.toFixed(6)),
     estimatedNet: Number(estimatedNet.toFixed(6)),
-    roi: Number(roi.toFixed(4)),
+
+    roi: Number(
+      ((estimatedNet / tradeSize) * 100).toFixed(4)
+    ),
 
     legs: routeQuote.legs,
     quoteStatus: "INDICATIVE",
@@ -256,7 +307,7 @@ async function discoveryScan() {
 
     for (const route of routes) {
       for (const tradeSize of sizes) {
-        attempted += 1;
+        attempted++;
 
         try {
           const routeQuote = await quoteRoute(
@@ -278,7 +329,7 @@ async function discoveryScan() {
             stage: "DISCOVERY",
             network: network.name,
             route: route.join(" → "),
-            tradeSize: tradeSize,
+            tradeSize,
             message: error.message
           });
 
@@ -306,6 +357,47 @@ async function confirmCandidate(candidate) {
     throw new Error("Candidate network not found");
   }
 
+  await sleep(3000);
+
+  const freshQuote = await quoteRoute(
+    network,
+    candidate.routeArray,
+    candidate.tradeSize
+  );
+
+  const confirmation = evaluateResult(
+    network,
+    candidate.routeArray,
+    candidate.tradeSize,
+    freshQuote
+  );
+
+  confirmation.discoveryNet =
+    candidate.estimatedNet;
+
+  confirmation.discoveryROI =
+    candidate.roi;
+
+  confirmation.confirmedAt =
+    new Date().toISOString();
+
+  confirmation.quoteStatus =
+    "FRESH_REQUOTE";
+
+  const minimumNet = Math.max(
+    0.02,
+    candidate.tradeSize * 0.00025
+  );
+
+  confirmation.status =
+    candidate.estimatedNet > 0 &&
+    confirmation.estimatedNet > minimumNet
+      ? "CONFIRMED"
+      : "REJECTED_AFTER_REQUOTE";
+
+  return confirmation;
+}
+
 async function paperExecute(candidate) {
   const network = NETWORKS.find(
     (item) =>
@@ -315,6 +407,58 @@ async function paperExecute(candidate) {
   if (!network) {
     throw new Error("Paper execution network not found");
   }
+
+  await sleep(2500);
+
+  const executionQuote = await quoteRoute(
+    network,
+    candidate.routeArray,
+    candidate.tradeSize
+  );
+
+  const execution = evaluateResult(
+    network,
+    candidate.routeArray,
+    candidate.tradeSize,
+    executionQuote
+  );
+
+  execution.confirmedNet =
+    candidate.estimatedNet;
+
+  execution.executedAt =
+    new Date().toISOString();
+
+  execution.quoteStatus =
+    "PAPER_EXECUTION_QUOTE";
+
+  const minimumNet = Math.max(
+    0.02,
+    candidate.tradeSize * 0.00025
+  );
+
+  if (execution.estimatedNet <= minimumNet) {
+    execution.status = "PAPER_REJECTED";
+    return execution;
+  }
+
+  execution.status = "PAPER_EXECUTED";
+
+  account.balance = Number(
+    (
+      account.balance +
+      execution.estimatedNet
+    ).toFixed(6)
+  );
+
+  account.realizedPnL = Number(
+    (
+      account.balance -
+      account.startingBalance
+    ).toFixed(6)
+  );
+
+  account.simulatedTrades++;
 
   tradeHistory.unshift({
     ...execution,
@@ -332,7 +476,7 @@ async function runCycle() {
   if (state.running) return;
 
   state.running = true;
-  state.cycle += 1;
+  state.cycle++;
   state.lastScanStarted = new Date().toISOString();
   state.rateLimited = false;
   state.errors = [];
@@ -400,13 +544,11 @@ async function runCycle() {
 
     if (state.confirmed.length > 0) {
       try {
-        const paperResult =
+        state.paperExecuted = [
           await paperExecute(
             state.confirmed[0]
-          );
-
-        state.paperExecuted =
-          [paperResult];
+          )
+        ];
       } catch (error) {
         state.errors.push({
           stage: "PAPER_EXECUTION",
@@ -438,9 +580,117 @@ async function backgroundLoop() {
       });
 
       state.running = false;
+      state.lastScanCompleted =
+        new Date().toISOString();
     }
 
     await sleep(45000);
+  }
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    engine: "ArbiFlow Opportunity Engine",
+    version: VERSION,
+    online: true,
+    mode: "paper-trading",
+    message: "Engine 2.1 is online."
+  });
+});
+
+app.get("/api/status", (req, res) => {
+  res.json({
+    engine: "ArbiFlow Opportunity Engine",
+    version: VERSION,
+    online: true,
+    liveProviderConfigured: Boolean(ZEROX_API_KEY),
+    provider: "0x Swap API",
+    running: state.running,
+    cycle: state.cycle,
+    startedAt: state.startedAt,
+    lastScanStarted: state.lastScanStarted,
+    lastScanCompleted: state.lastScanCompleted,
+    lastSuccessfulQuote: state.lastSuccessfulQuote,
+    rateLimited: state.rateLimited,
+
+    networks: NETWORKS.map(
+      (network) => ({
+        name: network.name,
+        chainId: network.chainId,
+        tokens: Object.keys(network.tokens)
+      })
+    )
+  });
+});
+
+app.get("/api/account", (req, res) => {
+  res.json({
+    ...account,
+    mode: "paper-trading",
+    tradeHistory
+  });
+});
+
+app.get("/api/opportunities", (req, res) => {
+  res.json({
+    engine: "ArbiFlow Opportunity Engine",
+    version: VERSION,
+    mode: "paper-trading",
+
+    balance: account.balance,
+    realizedPnL: account.realizedPnL,
+    simulatedTrades: account.simulatedTrades,
+
+    running: state.running,
+    cycle: state.cycle,
+
+    lastScanStarted: state.lastScanStarted,
+    lastScanCompleted: state.lastScanCompleted,
+    lastSuccessfulQuote: state.lastSuccessfulQuote,
+
+    rateLimited: state.rateLimited,
+
+    routesGenerated: state.routesGenerated,
+    testsAttempted: state.testsAttempted,
+    testsCompleted: state.testsCompleted,
+
+    candidatesFound: state.candidates.length,
+    confirmedFound: state.confirmed.length,
+
+    paperExecuted: state.paperExecuted,
+
+    executableOpportunities: 0,
+
+    candidates: state.candidates,
+    confirmed: state.confirmed,
+    bestTests: state.bestTests,
+    errors: state.errors
+  });
+});
+
+app.post("/api/scan/start", (req, res) => {
+  if (state.running) {
+    return res.json({
+      accepted: false,
+      message: "Engine is already scanning."
+    });
+  }
+
+  runCycle().catch(
+    (error) => {
+      state.errors.push({
+        stage: "MANUAL_SCAN",
+        message: error.message
+      });
+    }
+  );
+
+  return res.json({
+    accepted: true,
+    message: "Engine 2.1 scan started."
+  });
+});
+
 app.listen(PORT, () => {
   console.log(
     "ArbiFlow Opportunity Engine " +
