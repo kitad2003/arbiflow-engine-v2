@@ -1,0 +1,19 @@
+{
+  "name": "arbiflow-engine-v2",
+  "version": "2.0.0",
+  "private": true,
+  "description": "ArbiFlow Opportunity Engine 2.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
