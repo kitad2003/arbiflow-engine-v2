@@ -3,91 +3,26 @@ const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const ZEROX_API_KEY = process.env.ZEROX_API_KEY;
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 const STARTING_BALANCE = 500;
 
 const sleep = (ms) =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-/*
-========================================================
-ARBIFLOW OPPORTUNITY ENGINE 2.0
 
-Development / paper-trading engine.
-
-Stages:
-REJECTED
-CANDIDATE
-CONFIRMED
-
-EXECUTABLE is intentionally disabled until a later
-transaction + gas simulation layer is added.
-========================================================
-*/
-
-const NETWORKS = [
-  {
-    name: "Base",
-    chainId: 8453,
-
-    tokens: {
-      USDC: {
-        address:
-          "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-        decimals: 6
-      },
-
-      WETH: {
-        address:
-          "0x4200000000000000000000000000000000000006",
-        decimals: 18
-      },
-
-      DAI: {
-        address:
-          "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb",
-        decimals: 18
-      }
-    }
-  },
-
-  {
-    name: "Arbitrum",
-    chainId: 42161,
-
-    tokens: {
-      USDC: {
-        address:
-          "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
-        decimals: 6
-      },
-
-      USDT: {
-        address:
-          "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
-        decimals: 6
-      },
-
-      WETH: {
-        address:
-          "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
-        decimals: 18
-      },
-
-      ARB: {
-        address:
-          "0x912CE59144191C1204E64559FE8253a0e49E6548",
-        decimals: 18
-      }
-    }
-  }
-];
+/* =========================================================
+   NETWORKS
+========================================================= */
+/* =========================================================
+   PAPER ACCOUNT
+========================================================= */
 
 const account = {
   startingBalance: STARTING_BALANCE,
@@ -95,6 +30,13 @@ const account = {
   realizedPnL: 0,
   simulatedTrades: 0
 };
+
+const tradeHistory = [];
+
+
+/* =========================================================
+   ENGINE STATE
+========================================================= */
 
 const state = {
   running: false,
@@ -114,162 +56,24 @@ const state = {
   rejected: [],
   candidates: [],
   confirmed: [],
+  paperExecuted: [],
   bestTests: [],
 
   errors: []
 };
 
 
-/*
-========================================================
-UNIT HELPERS
-========================================================
-*/
-
-function toBaseUnits(amount, decimals) {
-
-  const value =
-    Number(amount).toFixed(decimals);
-
-  const [whole, fraction = ""] =
-    value.split(".");
-
-  const padded =
-    fraction.padEnd(decimals, "0");
-
-  return (
-    BigInt(whole) *
-      (10n ** BigInt(decimals)) +
-    BigInt(padded)
-  ).toString();
-}
-
-
-function fromBaseUnits(value, decimals) {
-
-  const amount =
-    BigInt(value);
-
-  const divisor =
-    10n ** BigInt(decimals);
-
-  const whole =
-    amount / divisor;
-
-  const remainder =
-    amount % divisor;
-
-  return (
-    Number(whole) +
-    Number(remainder) /
-      Number(divisor)
-  );
-}
-
-
-/*
-========================================================
-LIVE 0x PRICE
-========================================================
-*/
-
-async function getPrice(
-  network,
-  sellToken,
-  buyToken,
-  sellAmount,
-  attempt = 1
-) {
-
-  const params =
-    new URLSearchParams({
-      chainId:
-        String(network.chainId),
-
-      sellToken:
-        sellToken.address,
-
-      buyToken:
-        buyToken.address,
-
-      sellAmount:
-        String(sellAmount)
-    });
-
-
-  const response =
-    await fetch(
-      "https://api.0x.org/swap/allowance-holder/price?" +
-        params.toString(),
-      {
-        headers: {
-          "0x-api-key":
-            ZEROX_API_KEY,
-
-          "0x-version":
-            "v2"
-        }
-      }
-    );
-
-
-  if (response.status === 429) {
-
-    state.rateLimited = true;
-
-    if (attempt >= 4) {
-
-      throw new Error(
-        "0x rate limit remained active after retries"
-      );
-    }
-
-    await sleep(
-      attempt * 3500
-    );
-
-    return getPrice(
-      network,
-      sellToken,
-      buyToken,
-      sellAmount,
-      attempt + 1
-    );
-  }
-
-
-  if (!response.ok) {
-
-    const body =
-      await response.text();
-
-    throw new Error(
-      "0x HTTP " +
-      response.status +
-      ": " +
-      body
-    );
-  }
-
-
-  const data =
-    await response.json();
-
-
-  if (
-    data.liquidityAvailable === false
+/* =========================================================
+   UNIT HELPERS
+========================================================= */
+/* =========================================================
+   LIVE 0x PRICE
+========================================================= */
+    !data.buyAmount
   ) {
 
     throw new Error(
-      "No liquidity available"
-    );
-  }
-
-
-  if (!data.buyAmount) {
-
-    throw new Error(
-      "Quote returned no buyAmount"
+      "No usable liquidity or price"
     );
   }
 
@@ -279,24 +83,19 @@ async function getPrice(
 
 
   /*
-  Slow the engine intentionally.
-
-  We want a useful scanner, not one that immediately
-  overwhelms the quote provider.
+    Slow requests intentionally so the scanner
+    does not hammer the quote provider.
   */
 
   await sleep(1700);
-
 
   return data;
 }
 
 
-/*
-========================================================
-ROUTE GENERATION
-========================================================
-*/
+/* =========================================================
+   ROUTE GENERATION
+========================================================= */
 
 function generateRoutes(network) {
 
@@ -306,11 +105,6 @@ function generateRoutes(network) {
   const routes = [];
 
 
-  /*
-  Every route starts and ends in USDC because the
-  paper account is denominated in USDC.
-  */
-
   if (!symbols.includes("USDC")) {
 
     return routes;
@@ -318,9 +112,9 @@ function generateRoutes(network) {
 
 
   /*
-  Two-leg round trips:
+    ROUND TRIPS
 
-  USDC -> X -> USDC
+    USDC -> TOKEN -> USDC
   */
 
   for (const middle of symbols) {
@@ -338,9 +132,9 @@ function generateRoutes(network) {
 
 
   /*
-  Three-leg triangular paths:
+    TRIANGULAR ROUTES
 
-  USDC -> X -> Y -> USDC
+    USDC -> TOKEN A -> TOKEN B -> USDC
   */
 
   for (const first of symbols) {
@@ -348,6 +142,7 @@ function generateRoutes(network) {
     if (first === "USDC") {
       continue;
     }
+
 
     for (const second of symbols) {
 
@@ -357,6 +152,7 @@ function generateRoutes(network) {
       ) {
         continue;
       }
+
 
       routes.push([
         "USDC",
@@ -372,24 +168,18 @@ function generateRoutes(network) {
 }
 
 
-/*
-========================================================
-ADAPTIVE POSITION SIZES
-========================================================
-*/
+/* =========================================================
+   ADAPTIVE POSITION SIZING
+========================================================= */
 
 function getPositionSizes(balance) {
-
-  /*
-  Engine tests different percentages of available
-  paper capital rather than fixed dollar amounts.
-  */
 
   const percentages = [
     0.05,
     0.10,
     0.20,
-    0.35
+    0.35,
+    0.50
   ];
 
 
@@ -415,122 +205,12 @@ function getPositionSizes(balance) {
 }
 
 
-/*
-========================================================
-ROUTE QUOTING
-========================================================
-*/
-
-async function quoteRoute(
-  network,
-  route,
-  tradeSize
-) {
-
-  let currentAmount =
-    tradeSize;
-
-  const legs = [];
-
-
-  for (
-    let index = 0;
-    index < route.length - 1;
-    index++
-  ) {
-
-    const fromSymbol =
-      route[index];
-
-    const toSymbol =
-      route[index + 1];
-
-
-    const fromToken =
-      network.tokens[fromSymbol];
-
-    const toToken =
-      network.tokens[toSymbol];
-
-
-    if (
-      !fromToken ||
-      !toToken
-    ) {
-
-      throw new Error(
-        "Token missing from network configuration"
-      );
-    }
-
-
-    const amountIn =
-      currentAmount;
-
-
-    const quote =
-      await getPrice(
-        network,
-        fromToken,
-        toToken,
-        toBaseUnits(
-          amountIn,
-          fromToken.decimals
-        )
-      );
-
-
-    const amountOut =
-      fromBaseUnits(
-        quote.buyAmount,
-        toToken.decimals
-      );
-
-
-    legs.push({
-      from:
-        fromSymbol,
-
-      to:
-        toSymbol,
-
-      amountIn:
-        Number(
-          amountIn.toFixed(8)
-        ),
-
-      amountOut:
-        Number(
-          amountOut.toFixed(8)
-        ),
-
-      quotedAt:
-        new Date().toISOString()
-    });
-
-
-    currentAmount =
-      amountOut;
-
-
-    await sleep(700);
-  }
-
-
-  return {
-    finalAmount:
-      currentAmount,
-
-    legs
-  };
-}
-
-
-/*
-========================================================
-COST / PROFIT EVALUATION
-========================================================
-*/
+/* =========================================================
+   ROUTE QUOTING
+========================================================= */
+/* =========================================================
+   PROFIT EVALUATION
+========================================================= */
 
 function evaluateResult(
   network,
@@ -549,218 +229,16 @@ function evaluateResult(
 
 
   /*
-  This is deliberately conservative.
-
-  It is NOT yet a true on-chain gas simulation.
-
-  That will be added before anything can ever become
-  EXECUTABLE.
-  */
-
-  const safetyReserve =
-    Math.max(
-      0.05,
-      tradeSize * 0.002
-    );
-
-
-  const estimatedNet =
-    grossProfit -
-    safetyReserve;
-
-
-  const roi =
-    (
-      estimatedNet /
-      tradeSize
-    ) * 100;
-
-
-  return {
-    id:
-      [
-        network.chainId,
-        route.join("-"),
-        tradeSize,
-        Date.now()
-      ].join("_"),
-
-    network:
-      network.name,
-
-    chainId:
-      network.chainId,
-
-    route:
-      route.join(" → "),
-
-    routeArray:
-      route,
-
-    routeType:
-      route.length === 4
-        ? "TRIANGULAR"
-        : "ROUND_TRIP",
-
-    tradeSize:
-      Number(
-        tradeSize.toFixed(2)
-      ),
-
-    estimatedReturn:
-      Number(
-        returned.toFixed(6)
-      ),
-
-    grossProfit:
-      Number(
-        grossProfit.toFixed(6)
-      ),
-
-    safetyReserve:
-      Number(
-        safetyReserve.toFixed(6)
-      ),
-
-    estimatedNet:
-      Number(
-        estimatedNet.toFixed(6)
-      ),
-
-    roi:
-      Number(
-        roi.toFixed(4)
-      ),
-
-    legs:
-      routeQuote.legs,
-
-    quoteStatus:
-      "INDICATIVE",
-
-    status:
-      estimatedNet > 0
-        ? "CANDIDATE"
-        : "REJECTED",
-
-    testedAt:
-      new Date().toISOString()
-  };
-}
-
-
-/*
-========================================================
-INITIAL DISCOVERY
-========================================================
-*/
-
-async function discoveryScan() {
-
-  const results = [];
-
-  const sizes =
-    getPositionSizes(
-      account.balance
-    );
-
-
-  let generated =
-    0;
-
-  let attempted =
-    0;
-
-
-  for (
-    const network of NETWORKS
-  ) {
-
-    const routes =
-      generateRoutes(network);
-
-
-    generated +=
-      routes.length;
-
-
-    for (
-      const route of routes
-    ) {
-
-      for (
-        const tradeSize of sizes
-      ) {
-
-        attempted += 1;
-
-
-        try {
-
-          const routeQuote =
-            await quoteRoute(
-              network,
-              route,
-              tradeSize
-            );
-
-
-          const result =
-            evaluateResult(
-              network,
-              route,
-              tradeSize,
-              routeQuote
-            );
-
-
-          results.push(result);
-
-        } catch (error) {
-
-          state.errors.push({
-            stage:
-              "DISCOVERY",
-
-            network:
-              network.name,
-
-            route:
-              route.join(" → "),
-
-            tradeSize,
-
-            message:
-              error.message
-          });
-
-
-          await sleep(2500);
-        }
-
-
-        await sleep(1200);
-      }
-    }
-  }
-
-
-  state.routesGenerated =
-    generated;
-
-  state.testsAttempted =
-    attempted;
-
-
-  return results;
-}
-
-
-/*
-========================================================
-CANDIDATE CONFIRMATION
-========================================================
-*/
+    Conservative paper safety reserve.
+
+    IMPORTANT:
+    This is not yet true on-chain gas simulation.
+/* =========================================================
+   DISCOVERY SCAN
+========================================================= */
+/* =========================================================
+   CANDIDATE CONFIRMATION
+========================================================= */
 
 async function confirmCandidate(candidate) {
 
@@ -781,8 +259,8 @@ async function confirmCandidate(candidate) {
 
 
   /*
-  A candidate is re-quoted from the beginning with
-  fresh live prices.
+    Wait briefly, then completely re-quote
+    the candidate using fresh market prices.
   */
 
   await sleep(3000);
@@ -817,13 +295,6 @@ async function confirmCandidate(candidate) {
     new Date().toISOString();
 
 
-  /*
-  Require both scans to be positive.
-
-  Also require the second result to retain a minimum
-  amount of estimated profit.
-  */
-
   const minimumNet =
     Math.max(
       0.02,
@@ -841,8 +312,10 @@ async function confirmCandidate(candidate) {
     confirmation.status =
       "CONFIRMED";
 
+
     confirmation.quoteStatus =
       "FRESH_REQUOTE";
+
 
     return confirmation;
   }
@@ -850,6 +323,7 @@ async function confirmCandidate(candidate) {
 
   confirmation.status =
     "REJECTED_AFTER_REQUOTE";
+
 
   confirmation.quoteStatus =
     "FRESH_REQUOTE";
@@ -859,155 +333,209 @@ async function confirmCandidate(candidate) {
 }
 
 
-/*
-========================================================
-FULL ENGINE CYCLE
-========================================================
-*/
+/* =========================================================
+   PAPER EXECUTION
+========================================================= */
 
-async function runCycle() {
+async function paperExecute(candidate) {
 
-  if (state.running) {
-
-    return;
-  }
-
-
-  state.running =
-    true;
-
-  state.cycle +=
-    1;
-
-  state.lastScanStarted =
-    new Date().toISOString();
-
-  state.rateLimited =
-    false;
-
-  state.errors =
-    [];
-
-
-  try {
-
-    const results =
-      await discoveryScan();
-
-
-    results.sort(
-      (a, b) =>
-        b.estimatedNet -
-        a.estimatedNet
+  const network =
+    NETWORKS.find(
+      (item) =>
+        item.chainId ===
+        candidate.chainId
     );
 
 
-    state.testsCompleted =
-      results.length;
+  if (!network) {
+
+    throw new Error(
+      "Paper execution network not found"
+    );
+  }
 
 
-    state.bestTests =
-      results.slice(0, 20);
+  /*
+    THIRD fresh quote.
+
+    This is paper execution only.
+
+    No wallet.
+    No blockchain transaction.
+    No real funds.
+  */
+
+  await sleep(2500);
 
 
-    state.rejected =
-      results
-        .filter(
-          (item) =>
-            item.status ===
-            "REJECTED"
-        )
-        .slice(0, 50);
+  const executionQuote =
+    await quoteRoute(
+      network,
+      candidate.routeArray,
+      candidate.tradeSize
+    );
 
 
-    /*
-    Only strongest initial candidates advance to
-    confirmation. This prevents wasting API requests.
-    */
-
-    const candidates =
-      results
-        .filter(
-          (item) =>
-            item.status ===
-            "CANDIDATE"
-        )
-        .sort(
-          (a, b) =>
-            b.estimatedNet -
-            a.estimatedNet
-        )
-        .slice(0, 5);
+  const execution =
+    evaluateResult(
+      network,
+      candidate.routeArray,
+      candidate.tradeSize,
+      executionQuote
+    );
 
 
-    state.candidates =
-      candidates;
+  execution.confirmedNet =
+    candidate.estimatedNet;
 
 
-    const confirmations =
+  execution.executedAt =
+    new Date().toISOString();
+
+
+  execution.quoteStatus =
+    "PAPER_EXECUTION_QUOTE";
+
+
+  const minimumNet =
+    Math.max(
+      0.02,
+      candidate.tradeSize *
+        0.00025
+    );
+
+
+  /*
+    Opportunity disappeared before
+    paper execution.
+  */
+
+  if (
+    execution.estimatedNet <=
+    minimumNet
+  ) {
+
+    execution.status =
+      "PAPER_REJECTED";
+
+
+    return execution;
+  }
+
+
+  execution.status =
+    "PAPER_EXECUTED";
+
+
+  /*
+    Update the virtual account only after
+    the third fresh quote remains profitable.
+  */
+
+  account.balance =
+    Number(
+      (
+        account.balance +
+        execution.estimatedNet
+      ).toFixed(6)
+    );
+
+
+  account.realizedPnL =
+    Number(
+      (
+        account.balance -
+        account.startingBalance
+      ).toFixed(6)
+    );
+
+
+  account.simulatedTrades += 1;
+
+
+  const historyEntry = {
+    ...execution,
+
+    balanceAfter:
+      account.balance
+  };
+
+
+  tradeHistory.unshift(
+    historyEntry
+  );
+
+
+  /*
+    Prevent unlimited memory growth.
+  */
+
+  if (
+    tradeHistory.length > 100
+  ) {
+
+    tradeHistory.length = 100;
+  }
+
+
+  return execution;
+}
+
+
+/* =========================================================
+   FULL ENGINE CYCLE
+========================================================= */
+      Only strongest candidates advance
+      to confirmation.
+    state.paperExecuted =
       [];
 
 
-    for (
-      const candidate
-      of candidates
+    /*
+      Execute only the strongest confirmed
+      candidate in a cycle.
+
+      This avoids double-counting overlapping
+      paper opportunities.
+    */
+
+    if (
+      state.confirmed.length > 0
     ) {
 
       try {
 
-        const confirmed =
-          await confirmCandidate(
-            candidate
+        const paperResult =
+          await paperExecute(
+            state.confirmed[0]
           );
 
 
-        confirmations.push(
-          confirmed
-        );
+        state.paperExecuted =
+          [paperResult];
 
-      } catch (error) {
+      }
+
+      catch (error) {
 
         state.errors.push({
+
           stage:
-            "CONFIRMATION",
-
-          network:
-            candidate.network,
-
-          route:
-            candidate.route,
-
-          tradeSize:
-            candidate.tradeSize,
+            "PAPER_EXECUTION",
 
           message:
             error.message
         });
       }
-
-
-      await sleep(2500);
     }
 
+  }
 
-    state.confirmed =
-      confirmations
-        .filter(
-          (item) =>
-            item.status ===
-            "CONFIRMED"
-        )
-        .sort(
-          (a, b) =>
-            b.estimatedNet -
-            a.estimatedNet
-        );
-
-
-  } finally {
+  finally {
 
     state.lastScanCompleted =
       new Date().toISOString();
+
 
     state.running =
       false;
@@ -1015,11 +543,9 @@ async function runCycle() {
 }
 
 
-/*
-========================================================
-BACKGROUND LOOP
-========================================================
-*/
+/* =========================================================
+   BACKGROUND ENGINE
+========================================================= */
 
 async function backgroundLoop() {
 
@@ -1028,7 +554,7 @@ async function backgroundLoop() {
 
 
   /*
-  Give Render time to finish starting the service.
+    Allow Render to finish starting.
   */
 
   await sleep(5000);
@@ -1040,9 +566,12 @@ async function backgroundLoop() {
 
       await runCycle();
 
-    } catch (error) {
+    }
+
+    catch (error) {
 
       state.errors.push({
+
         stage:
           "ENGINE",
 
@@ -1054,13 +583,14 @@ async function backgroundLoop() {
       state.running =
         false;
 
+
       state.lastScanCompleted =
         new Date().toISOString();
     }
 
 
     /*
-    Pause between complete cycles.
+      Pause before next full scan.
     */
 
     await sleep(45000);
@@ -1068,17 +598,16 @@ async function backgroundLoop() {
 }
 
 
-/*
-========================================================
-API
-========================================================
-*/
+/* =========================================================
+   API
+========================================================= */
 
 app.get(
   "/",
   (req, res) => {
 
     res.json({
+
       engine:
         "ArbiFlow Opportunity Engine",
 
@@ -1089,87 +618,13 @@ app.get(
         true,
 
       mode:
-        "paper-development",
+        "paper-trading",
 
       message:
-        "Engine 2.0 is online."
-    });
-  }
-);
+        "Engine 2.1 is online."
+        "paper-trading",
 
-
-app.get(
-  "/api/status",
-  (req, res) => {
-
-    res.json({
-      engine:
-        "ArbiFlow Opportunity Engine",
-
-      version:
-        VERSION,
-
-      online:
-        true,
-
-      liveProviderConfigured:
-        Boolean(
-          ZEROX_API_KEY
-        ),
-
-      provider:
-        "0x Swap API",
-
-      running:
-        state.running,
-
-      cycle:
-        state.cycle,
-
-      startedAt:
-        state.startedAt,
-
-      lastScanStarted:
-        state.lastScanStarted,
-
-      lastScanCompleted:
-        state.lastScanCompleted,
-
-      lastSuccessfulQuote:
-        state.lastSuccessfulQuote,
-
-      rateLimited:
-        state.rateLimited,
-
-      networks:
-        NETWORKS.map(
-          (network) => ({
-            name:
-              network.name,
-
-            chainId:
-              network.chainId,
-
-            tokens:
-              Object.keys(
-                network.tokens
-              )
-          })
-        )
-    });
-  }
-);
-
-
-app.get(
-  "/api/account",
-  (req, res) => {
-
-    res.json({
-      ...account,
-
-      mode:
-        "paper-development"
+      tradeHistory
     });
   }
 );
@@ -1180,6 +635,7 @@ app.get(
   (req, res) => {
 
     res.json({
+
       engine:
         "ArbiFlow Opportunity Engine",
 
@@ -1187,10 +643,16 @@ app.get(
         VERSION,
 
       mode:
-        "paper-development",
+        "paper-trading",
 
       balance:
         account.balance,
+
+      realizedPnL:
+        account.realizedPnL,
+
+      simulatedTrades:
+        account.simulatedTrades,
 
       running:
         state.running,
@@ -1225,79 +687,22 @@ app.get(
       confirmedFound:
         state.confirmed.length,
 
+      paperExecuted:
+        state.paperExecuted,
+
       /*
-      Intentionally zero.
+        Still intentionally zero.
 
-      Confirmation is NOT equivalent to safe,
-      transaction-simulated executability.
-      */
-
-      executableOpportunities:
-        0,
-
-      candidates:
-        state.candidates,
-
-      confirmed:
-        state.confirmed,
-
-      bestTests:
-        state.bestTests,
-
-      errors:
-        state.errors
+        Real execution is NOT enabled.
+        "Engine 2.1 scan started."
     });
   }
 );
 
 
-app.post(
-  "/api/scan/start",
-  (req, res) => {
-
-    if (state.running) {
-
-      return res.json({
-        accepted:
-          false,
-
-        message:
-          "Engine is already scanning."
-      });
-    }
-
-
-    runCycle()
-      .catch(
-        (error) => {
-
-          state.errors.push({
-            stage:
-              "MANUAL_SCAN",
-
-            message:
-              error.message
-          });
-        }
-      );
-
-
-    return res.json({
-      accepted:
-        true,
-
-      message:
-        "Engine 2.0 scan started."
-    });
-  }
-);
-
-
-/*
-========================================================
-START
-========================================================
-*/
+/* =========================================================
+   START SERVER
+========================================================= */
 
 app.listen(
   PORT,
