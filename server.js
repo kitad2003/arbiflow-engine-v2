@@ -1472,6 +1472,43 @@ app.get(
 
    testsPlanned:
     state.testsPlanned,
+
+   testsAttempted:
+    state.testsAttempted,
+
+   testsCompleted:
+    state.testsCompleted,
+
+   candidatesFound:
+    state.candidates.length,
+
+   confirmedFound:
+    state.confirmed.length,
+
+   paperExecuted:
+    state.paperExecuted,
+
+   executableOpportunities:0,
+
+   candidates:
+    state.candidates,
+
+   confirmed:
+    state.confirmed,
+
+   bestTests:
+    state.bestTests,
+
+   errors:
+    state.errors
+  })
+);
+
+app.post(
+ "/api/scan/start",
+ (req,res)=>{
+  if(state.running){
+   return res
     .status(409)
     .json({
      accepted:false,
